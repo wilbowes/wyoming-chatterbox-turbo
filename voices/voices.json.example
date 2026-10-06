@@ -1,0 +1,4 @@
+{
+  "my-voice": {"ref": "my-voice.wav"},
+  "my-other-voice": {"ref": "my-other-voice.wav", "temperature": 0.5}
+}

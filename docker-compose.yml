@@ -1,0 +1,21 @@
+# Chatterbox-Turbo (350M, MIT) as Home Assistant's TTS over Wyoming, port 10304.
+# Model weights cache in ./hf-cache so a restart does not re-download.
+services:
+  wyoming-chatterbox-turbo:
+    build: .
+    image: wyoming-chatterbox-turbo
+    container_name: wyoming-chatterbox-turbo
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    # Without --default-voice the first entry in voices.json is used.
+    ports:
+      - "10304:10304"
+    volumes:
+      - ./voices:/voices:ro
+      - ./hf-cache:/root/.cache/huggingface

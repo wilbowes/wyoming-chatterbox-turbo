@@ -1,0 +1,4 @@
+hf-cache/
+voices/*.wav
+voices/voices.json
+__pycache__/
