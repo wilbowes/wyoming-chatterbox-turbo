@@ -53,8 +53,15 @@ right to clone.
 ```
 git clone https://github.com/wilbowes/wyoming-chatterbox-turbo && cd wyoming-chatterbox-turbo
 cp voices/voices.json.example voices/voices.json   # then add your clips
-docker compose up -d --build
+docker compose pull
+docker compose up -d
 ```
+
+The image is `ghcr.io/wilbowes/wyoming-chatterbox-turbo` (linux/amd64, about
+18 GB, versions tagged as `:0.1.0`). To build it yourself, use
+`docker compose up -d --build`. Each image carries a build-provenance
+attestation:
+`gh attestation verify oci://ghcr.io/wilbowes/wyoming-chatterbox-turbo:0.1.0 --repo wilbowes/wyoming-chatterbox-turbo`.
 
 The first start downloads the model into `./hf-cache`. The default voice is
 the first one in `voices.json`, or add `command: --default-voice my-voice` to

@@ -2,8 +2,8 @@
 # Model weights cache in ./hf-cache so a restart does not re-download.
 services:
   wyoming-chatterbox-turbo:
+    image: ghcr.io/wilbowes/wyoming-chatterbox-turbo:latest
     build: .
-    image: wyoming-chatterbox-turbo
     container_name: wyoming-chatterbox-turbo
     restart: unless-stopped
     deploy:
