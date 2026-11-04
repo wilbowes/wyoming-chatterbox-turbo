@@ -43,6 +43,30 @@ MAX_CHARS, GAP_S = 200, 0.12
 # line break they run together as one breathless sentence.
 SENTENCE = re.compile(r"(?<=[.!?])(?<!\d\.)\s+|\s*\n\s*")
 
+# Turbo reads "7:16" as "seven thousand sixteen" (a round trip through
+# whisper hears "7,016 p.m."), so clock times go out as words.
+ONES = ("zero one two three four five six seven eight nine ten eleven twelve thirteen "
+        "fourteen fifteen sixteen seventeen eighteen nineteen").split()
+TENS = {2: "twenty", 3: "thirty", 4: "forty", 5: "fifty"}
+CLOCK = re.compile(r"\b([01]?\d|2[0-3]):([0-5]\d)(?::[0-5]\d)?(?:\s*([AaPp])\.?\s?[Mm]\b)?(?![\d:])")
+
+
+def number(n: int) -> str:
+    return ONES[n] if n < 20 else TENS[n // 10] + ("" if n % 10 == 0 else " " + ONES[n % 10])
+
+
+def clock(m) -> str:
+    """7:16 PM -> seven sixteen PM, 7:05 -> seven oh five, 7:00 -> seven o'clock,
+    19:00 -> nineteen hundred; seconds are dropped."""
+    h, mm, ap = int(m[1]), int(m[2]), m[3]
+    hour = number(h if h or ap else 12)
+    if mm == 0:
+        mins = "" if ap else (" hundred" if h > 12 else " o'clock")
+    else:
+        mins = (" oh " if mm < 10 else " ") + number(mm)
+    return hour + mins + (" AM" if ap and ap in "Aa" else " PM" if ap else "")
+
+
 # An LLM writes Markdown for a screen; spoken, "*" is "asterisk".
 MARKDOWN = [
     (re.compile(r"\[([^\]]+)\]\([^)]*\)"), r"\1"),         # [text](url) -> text
@@ -52,6 +76,7 @@ MARKDOWN = [
     (re.compile(r"[\U0001F000-\U0001FAFF\u2600-\u27BF\uFE0F\u200D]"), ""),  # emoji
     (re.compile(r"\s*°\s*C\b"), " degrees"), (re.compile(r"\s*°\s*F\b"), " degrees Fahrenheit"),
     (re.compile(r"\s*°"), " degrees"), (re.compile(r"\s+&\s+"), " and "),
+    (CLOCK, clock),
     (re.compile(r"\s{2,}"), " "),
 ]
 
