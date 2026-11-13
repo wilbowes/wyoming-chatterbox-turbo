@@ -1,0 +1,24 @@
+# AMD GPUs (ROCm 6.4): docker compose -f docker-compose.amd.yml up -d
+# Needs the amdgpu kernel driver on the host; the ROCm runtime is in the image.
+services:
+  wyoming-chatterbox-turbo:
+    image: ghcr.io/wilbowes/wyoming-chatterbox-turbo:rocm
+    build:
+      context: .
+      dockerfile: Dockerfile.wheels
+      args:
+        BACKEND: rocm6.4
+    container_name: wyoming-chatterbox-turbo
+    restart: unless-stopped
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    # A card ROCm does not list (most Radeon iGPUs, older RDNA) may run as the
+    # nearest one it does, e.g. 10.3.0 for RDNA 2 or 11.0.0 for RDNA 3.
+    # environment:
+    #   HSA_OVERRIDE_GFX_VERSION: "11.0.0"
+    ports:
+      - "10304:10304"
+    volumes:
+      - ./voices:/voices:ro
+      - ./hf-cache:/root/.cache/huggingface

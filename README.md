@@ -27,9 +27,26 @@ English only.
 
 ## Requirements
 
-An NVIDIA GPU with the NVIDIA Container Toolkit. Turbo takes about 1.8 GB of
-VRAM. The image is built on PyTorch 2.9.1 with CUDA 12.8, which RTX 50-series
-cards need and older cards also run.
+A GPU, and about 2 GB of its memory for the model. One image per GPU stack:
+
+| GPU | Image | Compose file | Host needs |
+|-----|-------|--------------|------------|
+| NVIDIA | `:latest` | `docker-compose.yml` | the NVIDIA driver and Container Toolkit |
+| AMD (ROCm 6.4) | `:rocm` | `docker-compose.amd.yml` | the `amdgpu` kernel driver |
+| Intel Arc, Core Ultra (XPU) | `:xpu` | `docker-compose.intel.yml` | the `i915` or `xe` kernel driver |
+
+The NVIDIA image is built on PyTorch 2.9.1 with CUDA 12.8, which RTX 50-series
+cards need and older cards also run. The AMD and Intel images use PyTorch's
+own 2.9.1 wheels, which carry their GPU runtime, so the host needs only the
+kernel driver.
+
+**The AMD and Intel images are built and checked in CI but have not yet been
+run on AMD or Intel hardware.** If you run one, an issue saying which card and
+what `docker logs` printed on its first line would help.
+
+The first log line names the GPU in use. Without one it runs on the CPU,
+several times slower than real time. `--device cuda|xpu|cpu` (or `DEVICE=`)
+chooses instead of detecting; AMD under ROCm is `cuda`.
 
 ## Voices
 
@@ -53,12 +70,13 @@ right to clone.
 ```
 git clone https://github.com/wilbowes/wyoming-chatterbox-turbo && cd wyoming-chatterbox-turbo
 cp voices/voices.json.example voices/voices.json   # then add your clips
-docker compose pull
+docker compose pull                     # AMD: -f docker-compose.amd.yml, Intel: -f docker-compose.intel.yml
 docker compose up -d
 ```
 
-The image is `ghcr.io/wilbowes/wyoming-chatterbox-turbo` (linux/amd64, about
-18 GB, versions tagged as `:0.1.0`). To build it yourself, use
+The image is `ghcr.io/wilbowes/wyoming-chatterbox-turbo` (linux/amd64,
+versions tagged as `:0.1.0`, `:0.1.0-rocm` and `:0.1.0-xpu`; the NVIDIA one
+is about 18 GB). To build it yourself, use
 `docker compose up -d --build`. Each image carries a build-provenance
 attestation:
 `gh attestation verify oci://ghcr.io/wilbowes/wyoming-chatterbox-turbo:0.1.0 --repo wilbowes/wyoming-chatterbox-turbo`.

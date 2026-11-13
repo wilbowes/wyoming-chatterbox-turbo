@@ -209,9 +209,45 @@ class Handler(AsyncEventHandler):
                  (self.first or 0) * 1000, ms, len(self.spoken), " ".join(self.spoken))
 
 
+def pick_device(want: str = "auto") -> str:
+    """The torch device to run on. AMD under ROCm is "cuda" too (HIP keeps
+    the name); Intel Arc and Core Ultra graphics are "xpu"."""
+    if want != "auto":
+        return want
+    if torch.cuda.is_available():
+        return "cuda"
+    if hasattr(torch, "xpu") and torch.xpu.is_available():
+        return "xpu"
+    return "cpu"
+
+
+def describe(device: str) -> str:
+    if device == "cuda":
+        stack = f"ROCm {torch.version.hip}" if torch.version.hip else f"CUDA {torch.version.cuda}"
+        return f"{torch.cuda.get_device_name(0)} ({stack})"
+    if device == "xpu":
+        return f"{torch.xpu.get_device_name(0)} (XPU)"
+    return "CPU, no GPU found: several times slower than real time"
+
+
+def load(device: str) -> ChatterboxTurboTTS:
+    """Chatterbox maps weights to CPU only for "cpu" and "mps"; any other
+    device loads them where they were saved, which is CUDA, so on XPU they
+    are loaded to CPU and moved."""
+    if device in ("cuda", "cpu"):
+        return ChatterboxTurboTTS.from_pretrained(device=device)
+    m = ChatterboxTurboTTS.from_pretrained(device="cpu")
+    m.t3, m.s3gen, m.ve = m.t3.to(device), m.s3gen.to(device), m.ve.to(device)
+    if m.conds is not None:
+        m.conds = m.conds.to(device)
+    m.device = device
+    return m
+
+
 class TTS:
-    def __init__(self, voice_dir: str, voices: dict):
-        self.model = ChatterboxTurboTTS.from_pretrained(device="cuda")
+    def __init__(self, voice_dir: str, voices: dict, device: str = "cuda"):
+        log.info("running on %s", describe(device))
+        self.model = load(device)
         self.voices = {}
         for name, v in voices.items():
             self.model.prepare_conditionals(os.path.join(voice_dir, v["ref"]))
@@ -234,11 +270,14 @@ async def main():
     ap.add_argument("--uri", default="tcp://0.0.0.0:10304")
     ap.add_argument("--voice-dir", default="/voices")
     ap.add_argument("--default-voice", default=None)
+    ap.add_argument("--device", default=os.environ.get("DEVICE", "auto"),
+                    choices=["auto", "cuda", "xpu", "cpu"],
+                    help="auto: an NVIDIA or AMD GPU, else Intel, else CPU")
     args = ap.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     voices = json.load(open(os.path.join(args.voice_dir, "voices.json")))
     args.default_voice = args.default_voice or next(iter(voices))
-    tts = TTS(args.voice_dir, voices)
+    tts = TTS(args.voice_dir, voices, pick_device(args.device))
     attribution = Attribution(name="Resemble AI", url="https://huggingface.co/ResembleAI/chatterbox-turbo")
     info = Info(tts=[TtsProgram(
         name="chatterbox-turbo", description="Chatterbox-Turbo 350M (MIT)", attribution=attribution,

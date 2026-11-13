@@ -1,8 +1,12 @@
 name: Release (Docker image)
 
-# A vX.Y.Z tag publishes ghcr.io/<owner>/wyoming-chatterbox-turbo:X.Y.Z and
-# :latest for linux/amd64 (CUDA). Run by hand, it builds and checks the image
-# without publishing. There is no arm64 image: the model needs an NVIDIA GPU.
+# A vX.Y.Z tag publishes ghcr.io/<owner>/wyoming-chatterbox-turbo for
+# linux/amd64, one image per GPU stack:
+#   NVIDIA (CUDA)  :X.Y.Z       and :latest   (Dockerfile)
+#   AMD (ROCm)     :X.Y.Z-rocm  and :rocm     (Dockerfile.wheels, BACKEND=rocm6.4)
+#   Intel (XPU)    :X.Y.Z-xpu   and :xpu      (Dockerfile.wheels, BACKEND=xpu)
+# Run by hand, it builds and checks the images without publishing. No arm64:
+# the PyTorch GPU wheels are amd64 only.
 #
 # Plain docker rather than buildx: the image is about 20 GB, and buildx would
 # hold it once in its own cache and again in the image store to run it.
@@ -21,7 +25,27 @@ permissions:
 
 jobs:
   image:
+    name: image (${{ matrix.gpu }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - gpu: nvidia
+            dockerfile: Dockerfile
+            backend: ""
+            suffix: ""
+            floating: latest
+          - gpu: amd
+            dockerfile: Dockerfile.wheels
+            backend: rocm6.4
+            suffix: -rocm
+            floating: rocm
+          - gpu: intel
+            dockerfile: Dockerfile.wheels
+            backend: xpu
+            suffix: -xpu
+            floating: xpu
     permissions:
       contents: read
       packages: write
@@ -61,27 +85,36 @@ jobs:
 
       - name: Build
         env:
-          VERSION: ${{ steps.v.outputs.version }}
+          VERSION: ${{ steps.v.outputs.version }}${{ matrix.suffix }}
+          FLOATING: ${{ matrix.floating }}
+          DOCKERFILE: ${{ matrix.dockerfile }}
+          BACKEND: ${{ matrix.backend }}
         run: |
-          docker build \
+          docker build -f "$DOCKERFILE" ${BACKEND:+--build-arg "BACKEND=$BACKEND"} \
             --label "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
             --label "org.opencontainers.image.version=${VERSION}" \
             --label "org.opencontainers.image.description=Wyoming text-to-speech from Chatterbox-Turbo voice clones" \
             --label "org.opencontainers.image.licenses=MIT" \
-            -t "${IMAGE}:${VERSION}" -t "${IMAGE}:latest" .
+            -t "${IMAGE}:${VERSION}" -t "${IMAGE}:${FLOATING}" .
           docker image ls "${IMAGE}"; df -h / | tail -1
 
       # No GPU here, so the model is never loaded. This proves the pinned
-      # packages install into something that imports, and that the text
-      # handling in the image is the text handling in the repository.
+      # packages install into something that imports, that torch is the
+      # build for this GPU stack, and that the text handling in the image is
+      # the text handling in the repository.
       - name: The image imports and prepares text
         env:
-          VERSION: ${{ steps.v.outputs.version }}
+          VERSION: ${{ steps.v.outputs.version }}${{ matrix.suffix }}
+          GPU: ${{ matrix.gpu }}
         run: |
-          docker run --rm --entrypoint python "${IMAGE}:${VERSION}" -c "
-          import sys; sys.path.insert(0, '/app')
+          docker run --rm -e GPU --entrypoint python "${IMAGE}:${VERSION}" -c "
+          import os, sys; sys.path.insert(0, '/app')
           import shim, torch, chatterbox
           print('torch', torch.__version__)
+          built = {'nvidia': torch.version.cuda, 'amd': torch.version.hip,
+                   'intel': getattr(torch.version, 'xpu', None)}[os.environ['GPU']]
+          assert built, 'torch is not built for this GPU'
+          assert shim.pick_device() == 'cpu', shim.pick_device()
           assert shim.speakable('* **Hello** there') == 'Hello there.'
           assert shim.tags('Ha (laugh) yes') == 'Ha [chuckle] yes'
           assert shim.chunks('One. Two.') == ['One. Two.']
@@ -100,10 +133,11 @@ jobs:
         id: push
         if: steps.v.outputs.publish == 'true'
         env:
-          VERSION: ${{ steps.v.outputs.version }}
+          VERSION: ${{ steps.v.outputs.version }}${{ matrix.suffix }}
+          FLOATING: ${{ matrix.floating }}
         run: |
           docker push "${IMAGE}:${VERSION}"
-          docker push "${IMAGE}:latest"
+          docker push "${IMAGE}:${FLOATING}"
           digest=$(docker image inspect "${IMAGE}:${VERSION}" --format '{{range .RepoDigests}}{{println .}}{{end}}' | grep -m1 "^${IMAGE}@" | cut -d@ -f2)
           echo "$digest" | grep -Eq '^sha256:[0-9a-f]{64}$' || { echo "::error::no digest after push"; exit 1; }
           echo "digest=$digest" >> "$GITHUB_OUTPUT"

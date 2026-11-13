@@ -1,0 +1,16 @@
+# Chatterbox's own requirements less torch, torchaudio (from the base image or
+# the backend's wheel index) and gradio (only its demo UI uses it). chatterbox-tts
+# itself is installed --no-deps: it pins torch 2.6, which predates RTX 50 cards.
+numpy==1.26.4
+librosa==0.11.0
+s3tokenizer==0.3.0
+transformers==5.2.0
+diffusers==0.29.0
+resemble-perth==1.0.1
+conformer==0.3.2
+safetensors==0.5.3
+spacy-pkuseg==1.0.1
+pykakasi==2.3.0
+pyloudnorm==0.2.0
+omegaconf==2.3.1
+wyoming==1.8.0
