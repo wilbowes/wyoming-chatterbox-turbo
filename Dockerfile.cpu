@@ -1,0 +1,50 @@
+# Chatterbox-Turbo behind Wyoming with no GPU (shim_cpu.py): T3 in chatterbox.cpp
+# (ggml, 8-bit), the rest in PyTorch and OpenVINO on the CPU. An Intel iGPU, if
+# passed in, runs the flow estimator.
+#
+# chatterbox.cpp is pinned and patched with cpu/chatterbox.cpp-t3d.patch, which
+# adds t3d: T3 kept resident with the voice prefix cached, streaming each token.
+# It calls ggml's CPU backend directly, so ggml cannot pick a CPU at run time:
+# t3d is built once per x86 level and shim_cpu.py picks one from /proc/cpuinfo.
+
+FROM ubuntu:24.04 AS t3d
+ARG CHATTERBOX_CPP=ddca05f
+RUN apt-get update && apt-get install -y --no-install-recommends build-essential cmake git ca-certificates patch \
+    && rm -rf /var/lib/apt/lists/*
+RUN git clone https://github.com/gianni-cor/chatterbox.cpp /src && git -C /src checkout "$CHATTERBOX_CPP" \
+    && bash /src/scripts/setup-ggml.sh
+COPY cpu/chatterbox.cpp-t3d.patch /tmp/t3d.patch
+RUN cd /src && patch -p2 < /tmp/t3d.patch
+# No -march=native: the image has to run on CPUs other than the build machine's.
+RUN set -e; common="-DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF -DBUILD_SHARED_LIBS=OFF -DGGML_AVX=ON -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON"; \
+    for level in avx2 avx2-vnni avx512; do \
+      case $level in \
+        avx2)      extra="" ;; \
+        avx2-vnni) extra="-DGGML_AVX_VNNI=ON" ;; \
+        avx512)    extra="-DGGML_AVX512=ON -DGGML_AVX512_VNNI=ON" ;; \
+      esac; \
+      cmake -S /src -B /build/$level $common $extra >/dev/null; \
+      cmake --build /build/$level -j"$(nproc)" --target t3d; \
+      mkdir -p /opt/t3d/$level && cp /build/$level/t3d /opt/t3d/$level/; \
+    done
+
+FROM ubuntu:24.04
+ENV PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1 PIP_DEFAULT_TIMEOUT=120 DEBIAN_FRONTEND=noninteractive
+# intel-opencl-icd: OpenVINO's GPU plugin, for an Intel iGPU. Unused without one.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends python3 python3-venv libsndfile1 ffmpeg ca-certificates \
+         intel-opencl-icd ocl-icd-libopencl1 \
+    && rm -rf /var/lib/apt/lists/*
+RUN python3 -m venv /venv
+ENV PATH=/venv/bin:$PATH
+COPY requirements.txt /app/requirements.txt
+RUN pip install torch==2.9.1 torchaudio==2.9.1 --index-url https://download.pytorch.org/whl/cpu \
+    && pip install -r /app/requirements.txt && pip install --no-deps chatterbox-tts==0.1.7 \
+    && pip install openvino==2025.3.0 onnx==1.19.1 gguf==0.17.1 \
+    && python -c "import torch, sys; v = torch.__version__; print('torch', v); sys.exit(0 if v.endswith('+cpu') else 1)"
+COPY --from=t3d /opt/t3d /opt/t3d
+COPY --from=t3d /src/scripts /opt/chatterbox.cpp/scripts
+COPY shim.py shim_cpu.py /app/
+COPY cpu/prepare.py /app/cpu/prepare.py
+WORKDIR /app
+ENTRYPOINT ["python", "/app/shim_cpu.py"]

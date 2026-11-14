@@ -1,0 +1,25 @@
+# No GPU: docker compose -f docker-compose.cpu.yml up -d
+# The first start makes the CPU model files in ./models (a few minutes, once).
+services:
+  wyoming-chatterbox-turbo:
+    image: ghcr.io/wilbowes/wyoming-chatterbox-turbo:cpu
+    build:
+      context: .
+      dockerfile: Dockerfile.cpu
+    container_name: wyoming-chatterbox-turbo
+    restart: unless-stopped
+    ports:
+      - "10304:10304"
+    volumes:
+      - ./voices:/voices:ro
+      - ./hf-cache:/root/.cache/huggingface
+      - ./models:/models
+    # An Intel iGPU (UHD 7xx, Iris Xe, Arc) runs the flow estimator about 1.5x
+    # faster than the CPU. Pass its render node and the group that owns it:
+    #   ls -ln /dev/dri/   (renderD128 is usually the iGPU; the number after
+    #                       the owner is the group id)
+    # devices:
+    #   - /dev/dri/renderD128:/dev/dri/renderD128
+    # group_add: ["<render group id>"]
+    # environment:
+    #   - THREADS=6        # default: one per physical core, at most 8
