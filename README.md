@@ -27,13 +27,15 @@ English only.
 
 ## Requirements
 
-A GPU, and about 2 GB of its memory for the model. One image per GPU stack:
+A GPU with about 2 GB of free memory, or no GPU and a CPU with AVX2
+([Without a GPU](#without-a-gpu)). One image per stack:
 
 | GPU | Image | Compose file | Host needs |
 |-----|-------|--------------|------------|
 | NVIDIA | `:latest` | `docker-compose.yml` | the NVIDIA driver and Container Toolkit |
 | AMD (ROCm 6.4) | `:rocm` | `docker-compose.amd.yml` | the `amdgpu` kernel driver |
 | Intel Arc, Core Ultra (XPU) | `:xpu` | `docker-compose.intel.yml` | the `i915` or `xe` kernel driver |
+| none | `:cpu` | `docker-compose.cpu.yml` | an x86-64 CPU with AVX2; an Intel iGPU helps |
 
 The NVIDIA image is built on PyTorch 2.9.1 with CUDA 12.8, which RTX 50-series
 cards need and older cards also run. The AMD and Intel images use PyTorch's
@@ -44,9 +46,50 @@ kernel driver.
 run on AMD or Intel hardware.** If you run one, an issue saying which card and
 what `docker logs` printed on its first line would help.
 
-The first log line names the GPU in use. Without one it runs on the CPU,
-several times slower than real time. `--device cuda|xpu|cpu` (or `DEVICE=`)
+The first log line names the GPU in use. Without one the GPU images run on
+the CPU, several times slower than real time; use the `:cpu` image instead. `--device cuda|xpu|cpu` (or `DEVICE=`)
 chooses instead of detecting; AMD under ROCm is `cuda`.
+
+## Without a GPU
+
+The `:cpu` image splits the model so it streams in real time on a desktop
+CPU:
+
+- **T3** (text to speech tokens) runs in
+  [chatterbox.cpp](https://github.com/gianni-cor/chatterbox.cpp), 8-bit, as
+  one resident process that keeps the voice loaded between sentences and
+  hands over each token as it is made. The image carries a build for AVX2,
+  AVX2 with VNNI and AVX-512, and picks one for the CPU it starts on.
+- **The flow estimator** runs in OpenVINO, on an Intel iGPU if one is passed
+  in, otherwise on the CPU.
+- **Each sentence streams in chunks**, so the first audio does not wait for
+  the whole sentence.
+- **One flow step** instead of Turbo's two, and **the last 3 seconds** of
+  the reference clip for the audio stage. Neither could be heard in a blind
+  A/B.
+
+Measured on one machine only, an Intel i5-12500 (6 cores) with UHD 770
+graphics, time from the reply's text to its first audio:
+
+| Reply | iGPU | CPU only |
+|-------|------|----------|
+| "Done." | 0.49 s | 0.48 s |
+| one 15-word sentence | 1.31 s | 1.43 s |
+| "Done." then a 15-word sentence | 0.45 s, 0.29 s gap | 0.49 s, 0.47 s gap |
+
+In a full Home Assistant voice turn (speech to text, a local LLM, this) it
+started speaking 1.8 to 2.0 s after the end of speech, against 1.3 to 2.3 s
+for the NVIDIA image on an RTX 5060 Ti.
+
+The first start makes three model files from Resemble's weights in
+`./models` (about 850 MB, a minute or two) and checks the two OpenVINO
+graphs against PyTorch. To pass an Intel iGPU in, uncomment the `devices` and
+`group_add` lines in `docker-compose.cpu.yml`; startup then takes about 40 s
+longer to compile its shapes. `THREADS` defaults to one per physical core, at
+most 8: hyperthreads and efficiency cores made it slower, not faster.
+
+**Not yet run on an AMD CPU.** If you run it on one, an issue with the CPU
+model and the `t3d` line from `docker logs` would help.
 
 ## Voices
 
@@ -70,13 +113,13 @@ right to clone.
 ```
 git clone https://github.com/wilbowes/wyoming-chatterbox-turbo && cd wyoming-chatterbox-turbo
 cp voices/voices.json.example voices/voices.json   # then add your clips
-docker compose pull                     # AMD: -f docker-compose.amd.yml, Intel: -f docker-compose.intel.yml
+docker compose pull                     # AMD: -f docker-compose.amd.yml, Intel: -f docker-compose.intel.yml, no GPU: -f docker-compose.cpu.yml
 docker compose up -d
 ```
 
 The image is `ghcr.io/wilbowes/wyoming-chatterbox-turbo` (linux/amd64,
-versions tagged as `:0.1.0`, `:0.1.0-rocm` and `:0.1.0-xpu`; the NVIDIA one
-is about 18 GB). To build it yourself, use
+versions tagged as `:0.1.0`, `:0.1.0-rocm`, `:0.1.0-xpu` and `:0.1.0-cpu`;
+the NVIDIA one is about 18 GB, the CPU one 2.7 GB). To build it yourself, use
 `docker compose up -d --build`. Each image carries a build-provenance
 attestation:
 `gh attestation verify oci://ghcr.io/wilbowes/wyoming-chatterbox-turbo:0.1.0 --repo wilbowes/wyoming-chatterbox-turbo`.
@@ -104,4 +147,5 @@ HOST=192.168.1.10 python3 stream_test.py out.wav "Hello there. This is a test." 
 
 ## Licence
 
-MIT. Chatterbox-Turbo is Resemble AI's, also MIT.
+MIT. Chatterbox-Turbo is Resemble AI's, also MIT. The CPU image builds
+chatterbox.cpp (MIT) with the patch in `cpu/`.
