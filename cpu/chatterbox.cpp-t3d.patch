@@ -1,0 +1,335 @@
+diff -ruN '--exclude=.git' dl/chatterbox.cpp/CMakeLists.txt svc/src-cbcpp/CMakeLists.txt
+--- dl/chatterbox.cpp/CMakeLists.txt	2026-11-14 01:08:40.866775214 +0000
++++ svc/src-cbcpp/CMakeLists.txt	2026-11-14 03:30:29.854843866 +0000
+@@ -97,6 +97,10 @@
+     add_executable(tts-cli src/cli_main.cpp)
+     target_link_libraries(tts-cli PRIVATE tts-cpp)
+ 
++    add_executable(t3d src/t3d.cpp)
++    target_link_libraries(t3d PRIVATE tts-cpp)
++    target_include_directories(t3d PRIVATE src)
++
+     add_executable(chatterbox src/cli_main.cpp)
+     target_link_libraries(chatterbox PRIVATE tts-cpp)
+ 
+diff -ruN '--exclude=.git' dl/chatterbox.cpp/src/chatterbox_t3_internal.h svc/src-cbcpp/src/chatterbox_t3_internal.h
+--- dl/chatterbox.cpp/src/chatterbox_t3_internal.h	2026-11-14 01:08:40.871775419 +0000
++++ svc/src-cbcpp/src/chatterbox_t3_internal.h	2026-11-14 03:30:29.854843866 +0000
+@@ -278,6 +278,10 @@
+     std::vector<float> &         logits_out,
+     int &                        prompt_len);
+ 
++bool eval_prefix(const chatterbox_model & model, ggml_gallocr_t allocr, int n_threads);
++bool eval_suffix(
++    const chatterbox_model & model, ggml_gallocr_t allocr, int n_threads,
++    const std::vector<int32_t> & text_tokens, std::vector<float> & logits_out, int & prompt_len);
+ bool eval_step(
+     const chatterbox_model & model,
+     ggml_gallocr_t           allocr,
+diff -ruN '--exclude=.git' dl/chatterbox.cpp/src/main.cpp svc/src-cbcpp/src/main.cpp
+--- dl/chatterbox.cpp/src/main.cpp	2026-11-14 01:08:40.874775543 +0000
++++ svc/src-cbcpp/src/main.cpp	2026-11-14 03:30:29.854843866 +0000
+@@ -711,6 +711,104 @@
+     return true;
+ }
+ 
++// ---- Voice-prefix KV cache (patch for a resident T3 daemon) ----------------
++// The prompt is [speaker_emb proj | cond_prompt_speech_tokens | text | start].
++// The first 1 + cond_prompt_len positions depend only on the voice, so they are
++// evaluated once into the KV cache (eval_prefix) and each sentence evaluates
++// only text + start at positions after them (eval_suffix). Same arithmetic as
++// eval_prompt, causal mask offset by the prefix.
++static void set_causal_mask(ggml_cgraph * gf, int n_past, int N) {
++    ggml_tensor * kq_mask = ggml_graph_get_tensor(gf, "kq_mask");
++    if (!kq_mask) return;
++    const int L = n_past + N;
++    const ggml_fp16_t zero_h = ggml_fp32_to_fp16(0.0f), ninf_h = ggml_fp32_to_fp16(-INFINITY);
++    std::vector<ggml_fp16_t> mask((size_t)L * N, zero_h);
++    for (int q = 0; q < N; ++q)
++        for (int k = n_past + q + 1; k < L; ++k) mask[(size_t)q * L + k] = ninf_h;
++    ggml_backend_tensor_set(kq_mask, mask.data(), 0, mask.size()*sizeof(ggml_fp16_t));
++}
++
++static ggml_cgraph * build_prefix_graph(const chatterbox_model & model) {
++    const int N = 1 + model.hparams.cond_prompt_len;
++    static size_t buf_size = ggml_tensor_overhead()*CHBX_MAX_NODES + ggml_graph_overhead_custom(CHBX_MAX_NODES, false);
++    thread_local std::vector<uint8_t> buf(buf_size);
++    ggml_init_params p = { buf_size, buf.data(), true };
++    ggml_context * ctx = ggml_init(p);
++    ggml_cgraph * gf = ggml_new_graph_custom(ctx, CHBX_MAX_NODES, false);
++    ggml_tensor * position = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, N);
++    ggml_set_name(position, "position"); ggml_set_input(position);
++    ggml_tensor * spkr = ggml_add(ctx, ggml_mul_mat(ctx, model.cond_spkr_w, model.builtin_speaker_emb), model.cond_spkr_b);
++    ggml_tensor * cond = ggml_get_rows(ctx, model.speech_emb, model.builtin_cond_prompt_tokens);
++    ggml_tensor * inp = ggml_concat(ctx, spkr, cond, 1);
++    inp = ggml_add(ctx, inp, ggml_get_rows(ctx, model.wpe, position));
++    build_transformer_core(ctx, gf, model, inp, 0, N);
++    ggml_free(ctx);
++    return gf;
++}
++
++static ggml_cgraph * build_suffix_graph(const chatterbox_model & model, int n_text_tokens) {
++    const int P = 1 + model.hparams.cond_prompt_len, N = n_text_tokens + 1;
++    static size_t buf_size = ggml_tensor_overhead()*CHBX_MAX_NODES + ggml_graph_overhead_custom(CHBX_MAX_NODES, false);
++    thread_local std::vector<uint8_t> buf(buf_size);
++    ggml_init_params p = { buf_size, buf.data(), true };
++    ggml_context * ctx = ggml_init(p);
++    ggml_cgraph * gf = ggml_new_graph_custom(ctx, CHBX_MAX_NODES, false);
++    ggml_tensor * text_tokens = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_text_tokens);
++    ggml_set_name(text_tokens, "text_tokens"); ggml_set_input(text_tokens);
++    ggml_tensor * start_token = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
++    ggml_set_name(start_token, "speech_token"); ggml_set_input(start_token);
++    ggml_tensor * position = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, N);
++    ggml_set_name(position, "position"); ggml_set_input(position);
++    ggml_tensor * inp = ggml_concat(ctx, ggml_get_rows(ctx, model.text_emb, text_tokens),
++                                    ggml_get_rows(ctx, model.speech_emb, start_token), 1);
++    inp = ggml_add(ctx, inp, ggml_get_rows(ctx, model.wpe, position));
++    build_transformer_core(ctx, gf, model, inp, P, N);
++    ggml_free(ctx);
++    return gf;
++}
++
++bool eval_prefix(const chatterbox_model & model, ggml_gallocr_t allocr, int n_threads) {
++    const int N = 1 + model.hparams.cond_prompt_len;
++    ggml_cgraph * gf = build_prefix_graph(model);
++    ggml_gallocr_reserve(allocr, gf);
++    ggml_gallocr_alloc_graph(allocr, gf);
++    std::vector<int32_t> pos(N);
++    for (int i = 0; i < N; ++i) pos[i] = i;
++    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "position"), pos.data(), 0, pos.size()*sizeof(int32_t));
++    set_causal_mask(gf, 0, N);
++    if (ggml_backend_is_cpu(model.backend)) ggml_backend_cpu_set_n_threads(model.backend, n_threads);
++    return ggml_backend_graph_compute(model.backend, gf) == GGML_STATUS_SUCCESS;
++}
++
++bool eval_suffix(
++    const chatterbox_model & model, ggml_gallocr_t allocr, int n_threads,
++    const std::vector<int32_t> & text_tokens, std::vector<float> & logits_out, int & prompt_len) {
++    const int P = 1 + model.hparams.cond_prompt_len, N = (int)text_tokens.size() + 1;
++    prompt_len = P + N;
++    if (prompt_len > model.hparams.n_ctx) {
++        fprintf(stderr, "%s: prompt %d exceeds context %d\n", __func__, prompt_len, model.hparams.n_ctx);
++        return false;
++    }
++    ggml_cgraph * gf = build_suffix_graph(model, (int)text_tokens.size());
++    ggml_gallocr_reserve(allocr, gf);
++    ggml_gallocr_alloc_graph(allocr, gf);
++    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "text_tokens"), text_tokens.data(), 0, text_tokens.size()*sizeof(int32_t));
++    int32_t st = model.hparams.start_speech_token;
++    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "speech_token"), &st, 0, sizeof(st));
++    std::vector<int32_t> pos(N);
++    for (int i = 0; i < N; ++i) pos[i] = P + i;
++    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "position"), pos.data(), 0, pos.size()*sizeof(int32_t));
++    set_causal_mask(gf, P, N);
++    if (ggml_backend_is_cpu(model.backend)) ggml_backend_cpu_set_n_threads(model.backend, n_threads);
++    ggml_backend_graph_compute(model.backend, gf);
++    ggml_tensor * logits = ggml_graph_get_tensor(gf, "logits");
++    logits_out.resize(model.hparams.n_speech_vocab);
++    ggml_backend_tensor_get(logits, logits_out.data(),
++        (size_t)model.hparams.n_speech_vocab*(N-1)*sizeof(float),
++        (size_t)model.hparams.n_speech_vocab*sizeof(float));
++    return true;
++}
++
+ bool eval_step(
+     const chatterbox_model & model, ggml_gallocr_t allocr, int n_threads,
+     int n_past, int32_t token, std::vector<float> & logits_out) {
+diff -ruN '--exclude=.git' dl/chatterbox.cpp/src/t3d.cpp svc/src-cbcpp/src/t3d.cpp
+--- dl/chatterbox.cpp/src/t3d.cpp	1970-01-01 00:00:00.000000000 +0000
++++ svc/src-cbcpp/src/t3d.cpp	2026-11-14 04:33:14.078395279 +0000
+@@ -0,0 +1,195 @@
++// t3d: resident T3 (text tokens -> speech tokens) for the Wyoming shim.
++// Loads the T3 GGUF once and keeps the current voice's prefix
++// (speaker_emb + cond prompt) in the KV cache, so a sentence costs only its
++// own text plus decode. Sampling, the early-stop retry and its RNG streams
++// follow tts-cli's turbo path.
++//
++// stdin, one request per line, tab-separated:
++//   voice_dir  temp  top_k  top_p  repeat_penalty  seed  n_predict  tok,tok,...
++// stdout, one reply per line:
++//   T <tok>            each speech token as it is sampled (stop token not sent)
++//   R                  an early-stop retry: discard the T lines sent so far
++//   OK <prefix_ms> <t3_ms> <n_tokens> <attempts>\t<tok,tok,...>   |   ERR <message>
++//
++// t3d --check MODEL VOICE_DIR TOKENS : max |logits| difference between the
++// full-prompt path (eval_prompt) and prefix + suffix. Expect float noise.
++#include "chatterbox_t3_internal.h"
++#include "npy.h"
++#include "ggml-backend.h"
++#include "ggml-cpu.h"
++
++#include <algorithm>
++#include <chrono>
++#include <fstream>
++#include <iterator>
++#include <random>
++#include <cmath>
++#include <cstdio>
++#include <iostream>
++#include <map>
++#include <sstream>
++#include <string>
++#include <vector>
++
++using namespace tts_cpp::chatterbox::detail;
++
++static double now_ms() {
++    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
++}
++
++static std::vector<std::string> split(const std::string & s, char d) {
++    std::vector<std::string> out; std::string cur; std::stringstream ss(s);
++    while (std::getline(ss, cur, d)) out.push_back(cur);
++    return out;
++}
++
++static std::vector<int32_t> parse_tokens(const std::string & s) {
++    std::vector<int32_t> t;
++    for (auto & x : split(s, ',')) if (!x.empty()) t.push_back((int32_t) std::stol(x));
++    return t;
++}
++
++struct Voices {
++    chatterbox_model & model;
++    ggml_tensor * orig_ct;
++    std::map<std::string, ggml_tensor *> ct_by_dir;
++    std::string current;
++
++    // Point the model at a voice; true if it changed (prefix must be re-evaluated).
++    bool use(const std::string & dir) {
++        if (dir == current) return false;
++        npy_array se = npy_load(dir + "/speaker_emb.npy");
++        npy_array ct = npy_load(dir + "/cond_prompt_speech_tokens.npy");
++        if ((int64_t) se.n_elements() != ggml_nelements(model.builtin_speaker_emb))
++            throw std::runtime_error("speaker_emb size mismatch in " + dir);
++        ggml_backend_tensor_set(model.builtin_speaker_emb, se.data.data(), 0, ggml_nbytes(model.builtin_speaker_emb));
++        const int64_t n = (int64_t) ct.n_elements();
++        ggml_tensor * t = nullptr;
++        if (n == ggml_nelements(orig_ct)) {
++            t = orig_ct;
++        } else if (ct_by_dir.count(dir)) {
++            t = ct_by_dir[dir];
++        } else {  // a shorter clip: its own tensor, kept for the life of the process
++            ggml_init_params op = { ggml_tensor_overhead(), nullptr, true };
++            ggml_context * c = ggml_init(op);
++            t = ggml_new_tensor_1d(c, GGML_TYPE_I32, n);
++            if (!ggml_backend_alloc_ctx_tensors(c, model.backend)) throw std::runtime_error("override alloc failed");
++            ct_by_dir[dir] = t;
++        }
++        ggml_backend_tensor_set(t, ct.data.data(), 0, n * sizeof(int32_t));
++        model.builtin_cond_prompt_tokens = t;
++        model.hparams.cond_prompt_len = (int32_t) n;
++        current = dir;
++        return true;
++    }
++};
++
++static std::vector<int32_t> generate(chatterbox_model & model, ggml_gallocr_t allocr, int n_threads,
++                                     const std::vector<int32_t> & text, const chatterbox_sampling_params & sp,
++                                     int seed, int n_predict, int & attempts) {
++    auto emit = [&](int32_t t) {
++        if (t != model.hparams.stop_speech_token) { printf("T %d\n", t); fflush(stdout); }
++    };
++    std::mt19937 rng(seed);
++    const int min_tokens = std::max(8, (int) text.size() * 5);
++    constexpr int MAX_RETRIES = 3;
++    auto rng_snapshot = rng;
++    std::vector<int32_t> generated, best;
++    std::vector<float> logits;
++    for (int attempt = 0; attempt <= MAX_RETRIES; ++attempt) {
++        rng = rng_snapshot;
++        rng.discard((size_t) attempt * 1009);
++        attempts = attempt + 1;
++        if (attempt > 0) { printf("R\n"); fflush(stdout); }
++        int prompt_len = 0;
++        if (!eval_suffix(model, allocr, n_threads, text, logits, prompt_len)) throw std::runtime_error("prompt eval failed");
++        int n_past = prompt_len;
++        generated.clear();
++        int32_t cur = sample_next_token_ex(logits, generated, sp, rng);
++        generated.push_back(cur); emit(cur);
++        bool stopped = false;
++        for (int i = 0; i < n_predict; ++i) {
++            if (cur == model.hparams.stop_speech_token) { stopped = true; break; }
++            if (n_past + 1 > model.hparams.n_ctx) break;
++            if (!eval_step(model, allocr, n_threads, n_past, cur, logits)) throw std::runtime_error("step eval failed");
++            ++n_past;
++            cur = sample_next_token_ex(logits, generated, sp, rng);
++            generated.push_back(cur); emit(cur);
++        }
++        if (!generated.empty() && generated.back() == model.hparams.stop_speech_token) generated.pop_back();
++        if (generated.size() > best.size()) best = generated;
++        if (!stopped || (int) generated.size() >= min_tokens) return generated;
++    }
++    return best;
++}
++
++int main(int argc, char ** argv) {
++    if (argc < 2) { fprintf(stderr, "usage: t3d MODEL [THREADS] | t3d --check MODEL VOICE_DIR TOKENS\n"); return 2; }
++    const bool check = std::string(argv[1]) == "--check";
++    const std::string model_path = check ? argv[2] : argv[1];
++    const int n_threads = (!check && argc > 2) ? std::atoi(argv[2]) : 6;
++    g_log_verbose = 0;
++    ggml_log_set(chatterbox_log_cb, nullptr);
++
++    chatterbox_model model;
++    double t0 = now_ms();
++    if (!load_model_gguf(model_path, model, 2048, 0)) return 1;
++    ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
++    Voices voices{model, model.builtin_cond_prompt_tokens, {}, ""};
++    fprintf(stderr, "t3d: loaded %s in %.0f ms, %d threads\n", model_path.c_str(), now_ms() - t0, n_threads);
++
++    if (check) {
++        std::ifstream f(argv[4]); std::string raw((std::istreambuf_iterator<char>(f)), {});
++        auto text = parse_tokens(raw);
++        voices.use(argv[3]);
++        std::vector<float> a, b; int pl = 0;
++        eval_prompt(model, allocr, n_threads, text, a, pl);
++        eval_prefix(model, allocr, n_threads);
++        double t = now_ms();
++        eval_suffix(model, allocr, n_threads, text, b, pl);
++        double ts = now_ms() - t;
++        float md = 0, mx = 0;
++        for (size_t i = 0; i < a.size(); ++i) { md = std::max(md, std::fabs(a[i] - b[i])); mx = std::max(mx, std::fabs(a[i])); }
++        printf("check: %zu logits, max|full| %.3f, max|full - prefix+suffix| %.2e, suffix %.0f ms\n", a.size(), mx, md, ts);
++        // What sampling sees: softmax at temperature 0.8, total variation distance.
++        auto sm = [](const std::vector<float> & l) {
++            std::vector<double> p(l.size()); double m = *std::max_element(l.begin(), l.end()), z = 0;
++            for (size_t i = 0; i < l.size(); ++i) z += p[i] = std::exp((l[i] - m) / 0.8);
++            for (auto & x : p) x /= z;
++            return p;
++        };
++        auto pa = sm(a), pb = sm(b); double tv = 0;
++        for (size_t i = 0; i < pa.size(); ++i) tv += std::fabs(pa[i] - pb[i]) / 2;
++        std::vector<float> a2; eval_prompt(model, allocr, n_threads, text, a2, pl);
++        float rep = 0; for (size_t i = 0; i < a.size(); ++i) rep = std::max(rep, std::fabs(a[i] - a2[i]));
++        printf("check: sampling distribution TV distance %.2e; full prompt run twice differs by %.2e\n", tv, rep);
++        return md < 1e-2f * std::max(1.0f, mx) ? 0 : 1;
++    }
++
++    std::string line;
++    while (std::getline(std::cin, line)) {
++        try {
++            auto f = split(line, '\t');
++            if (f.size() != 8) throw std::runtime_error("expected 8 tab-separated fields");
++            chatterbox_sampling_params sp;
++            sp.temp = std::stof(f[1]); sp.top_k = std::stoi(f[2]); sp.top_p = std::stof(f[3]);
++            sp.repeat_penalty = std::stof(f[4]);
++            double tp = now_ms(), prefix_ms = 0;
++            if (voices.use(f[0])) {
++                if (!eval_prefix(model, allocr, n_threads)) throw std::runtime_error("prefix eval failed");
++                prefix_ms = now_ms() - tp;
++            }
++            double tg = now_ms();
++            int attempts = 0;
++            auto toks = generate(model, allocr, n_threads, parse_tokens(f[7]), sp, std::stoi(f[5]), std::stoi(f[6]), attempts);
++            std::ostringstream o;
++            for (size_t i = 0; i < toks.size(); ++i) o << (i ? "," : "") << toks[i];
++            printf("OK %.0f %.0f %zu %d\t%s\n", prefix_ms, now_ms() - tg, toks.size(), attempts, o.str().c_str());
++        } catch (const std::exception & e) {
++            voices.current.clear();  // state unknown: re-evaluate the prefix next time
++            printf("ERR %s\n", e.what());
++        }
++        fflush(stdout);
++    }
++    return 0;
++}

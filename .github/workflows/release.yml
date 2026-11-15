@@ -5,6 +5,7 @@ name: Release (Docker image)
 #   NVIDIA (CUDA)  :X.Y.Z       and :latest   (Dockerfile)
 #   AMD (ROCm)     :X.Y.Z-rocm  and :rocm     (Dockerfile.wheels, BACKEND=rocm6.4)
 #   Intel (XPU)    :X.Y.Z-xpu   and :xpu      (Dockerfile.wheels, BACKEND=xpu)
+#   no GPU (CPU)   :X.Y.Z-cpu   and :cpu      (Dockerfile.cpu)
 # Run by hand, it builds and checks the images without publishing. No arm64:
 # the PyTorch GPU wheels are amd64 only.
 #
@@ -46,6 +47,11 @@ jobs:
             backend: xpu
             suffix: -xpu
             floating: xpu
+          - gpu: cpu
+            dockerfile: Dockerfile.cpu
+            backend: ""
+            suffix: -cpu
+            floating: cpu
     permissions:
       contents: read
       packages: write
@@ -111,9 +117,17 @@ jobs:
           import os, sys; sys.path.insert(0, '/app')
           import shim, torch, chatterbox
           print('torch', torch.__version__)
-          built = {'nvidia': torch.version.cuda, 'amd': torch.version.hip,
-                   'intel': getattr(torch.version, 'xpu', None)}[os.environ['GPU']]
-          assert built, 'torch is not built for this GPU'
+          gpu = os.environ['GPU']
+          if gpu == 'cpu':
+              assert torch.__version__.endswith('+cpu'), torch.__version__
+              import openvino, shim_cpu
+              for level in ('avx2', 'avx2-vnni', 'avx512'):
+                  assert os.access(f'/opt/t3d/{level}/t3d', os.X_OK), level
+              print('t3d for this runner:', shim_cpu.T3D_LEVEL)
+          else:
+              built = {'nvidia': torch.version.cuda, 'amd': torch.version.hip,
+                       'intel': getattr(torch.version, 'xpu', None)}[gpu]
+              assert built, 'torch is not built for this GPU'
           assert shim.pick_device() == 'cpu', shim.pick_device()
           assert shim.speakable('* **Hello** there') == 'Hello there.'
           assert shim.tags('Ha (laugh) yes') == 'Ha [chuckle] yes'
